@@ -30,6 +30,9 @@ export interface Peer {
   last_seen: string; // ISO timestamp
 }
 
+// Convenience alias — new code should use Agent
+export type Agent = Peer;
+
 export interface Message {
   id: number;
   from_id: AgentId;
