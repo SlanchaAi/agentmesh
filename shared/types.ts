@@ -88,6 +88,8 @@ export interface Agent {
   online: boolean;           // true if connected via WebSocket right now
   registered_at: string;
   last_seen: string;
+  /** null = registered on this broker; URL = registered on a remote federated broker */
+  broker_url: string | null;
 }
 
 export type Peer = Agent; // backwards-compat alias
@@ -263,6 +265,65 @@ export interface GetDeadLettersRequest {
 export interface GetDeadLettersResponse {
   dead_letters: DeadLetter[];
 }
+
+// ---------------------------------------------------------------------------
+// Broker federation protocol (broker-to-broker WS)
+// ---------------------------------------------------------------------------
+
+/** Unique stable identifier for a broker instance (hostname:port or configured) */
+export type BrokerId = string;
+
+// Frames sent from the connecting broker (client) to the accepting broker (server)
+export type FedClientFrame =
+  | {
+      type: "BROKER_CONNECT";
+      broker_id: BrokerId;
+      broker_url: string;        // the connecting broker's own reachable URL
+      fleet_id: string | null;
+      version: string;
+      secret_hash?: string;      // SHA256(FLEET_SECRET) — optional auth
+    }
+  | { type: "BROKER_DISCONNECT" }
+  | { type: "PING" }
+  | {
+      type: "FED_MESSAGE";
+      message: Message;
+    }
+  | {
+      type: "FED_BROADCAST";
+      origin_broker_id: BrokerId; // the broker that originated this broadcast (loop prevention)
+      topic: string;
+      from_id: AgentId;
+      text: string;
+      qos: QoS;
+      retain: boolean;
+    }
+  | { type: "AGENT_UPDATE"; agent: Agent }
+  | { type: "AGENT_REMOVE"; agent_id: AgentId };
+
+// Frames sent from the accepting broker (server) to the connecting broker (client)
+export type FedBrokerFrame =
+  | {
+      type: "BROKER_CONNECTED";
+      broker_id: BrokerId;
+      broker_url: string;
+      fleet_id: string | null;
+    }
+  | { type: "AGENT_SYNC"; agents: Agent[] }  // full agent list on connect
+  | { type: "AGENT_UPDATE"; agent: Agent }
+  | { type: "AGENT_REMOVE"; agent_id: AgentId }
+  | { type: "FED_MESSAGE"; message: Message }
+  | {
+      type: "FED_BROADCAST";
+      origin_broker_id: BrokerId;
+      topic: string;
+      from_id: AgentId;
+      text: string;
+      qos: QoS;
+      retain: boolean;
+    }
+  | { type: "PONG" }
+  | { type: "ERROR"; code: string; message: string };
 
 // ---------------------------------------------------------------------------
 // A2A Agent Cards (Google Agent-to-Agent protocol)

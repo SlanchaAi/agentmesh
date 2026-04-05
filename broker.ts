@@ -46,6 +46,9 @@ import type {
   WsBrokerFrame,
   AgentCard,
   AgentSkill,
+  BrokerId,
+  FedClientFrame,
+  FedBrokerFrame,
 } from "./shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -68,6 +71,13 @@ const REMOTE_PEER_TTL_MS = parseInt(process.env.AGENTMESH_PEER_TTL_MS ?? "60000"
 const FLEET_SECRET = process.env.AGENTMESH_FLEET_SECRET ?? null;
 // Rate limiting — max messages sent per agent per minute (0 = disabled)
 const RATE_LIMIT_RPM = parseInt(process.env.AGENTMESH_RATE_LIMIT_RPM ?? "100", 10);
+// Federation — comma-separated peer broker URLs
+const FEDERATION_PEERS = (process.env.AGENTMESH_FEDERATION_PEERS ?? "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+// This broker's own reachable URL (advertised to federation peers)
+const BROKER_OWN_URL = process.env.AGENTMESH_BROKER_URL ?? `http://${os.hostname()}:${PORT}`;
+// Stable broker ID
+const BROKER_ID: BrokerId = process.env.AGENTMESH_BROKER_ID ?? `${os.hostname()}:${PORT}`;
 
 // ---------------------------------------------------------------------------
 // Database
@@ -171,6 +181,7 @@ const migrations: string[] = [
   "ALTER TABLE messages ADD COLUMN ack_deadline TEXT",
   "ALTER TABLE messages ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE messages ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3",
+  "ALTER TABLE peers ADD COLUMN broker_url TEXT",  // null = local, URL = federated remote
 ];
 for (const m of migrations) {
   try { db.run(m); } catch {}
@@ -289,10 +300,14 @@ function topicMatches(topic: string, pattern: string): boolean {
 // ---------------------------------------------------------------------------
 
 function removePeer(id: AgentId) {
+  const isLocal = !db.query("SELECT broker_url FROM peers WHERE id = ?")
+    .get(id) as any;
   db.run("DELETE FROM peers WHERE id = ?", [id]);
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
   db.run("DELETE FROM subscriptions WHERE agent_id = ?", [id]);
   wsConnections.delete(id);
+  // Only notify federation for local agents (not when cleaning up remote mirrors)
+  if (isLocal) fedNotifyAgentRemove(id);
 }
 
 function cleanStalePeers() {
@@ -380,6 +395,33 @@ type DeliveryResult = "ws" | "webhook" | "queued";
 async function deliverToAgent(toId: AgentId, message: Message): Promise<DeliveryResult> {
   const signed = attachSignature({ ...message });
 
+  // 0. Check if this is a federated remote agent
+  const peerRow = db.query("SELECT transport_type, transport_webhook_url, broker_url FROM peers WHERE id = ?")
+    .get(toId) as { transport_type: string; transport_webhook_url: string | null; broker_url: string | null } | null;
+
+  if (peerRow?.broker_url) {
+    // Route via federation: find the WS connection to that broker
+    const brokerUrl = peerRow.broker_url;
+    // Try client-side connection first
+    const fedPeer = fedPeers.get(brokerUrl);
+    if (fedPeer?.connected) {
+      fedSend(fedPeer, { type: "FED_MESSAGE", message: signed });
+      if (message.qos === 0) markDelivered.run(message.id);
+      return "ws";
+    }
+    // Try server-side connection
+    for (const [, ws] of fedServerConnections) {
+      const d = ws.data as FedServerData;
+      if (d.peer_broker_url === brokerUrl) {
+        ws.send(JSON.stringify({ type: "FED_MESSAGE", message: signed } satisfies FedBrokerFrame));
+        if (message.qos === 0) markDelivered.run(message.id);
+        return "ws";
+      }
+    }
+    // Federation peer unreachable — queue locally (will retry)
+    return "queued";
+  }
+
   // 1. WebSocket — instant push (preferred for online agents)
   if (wsConnections.has(toId)) {
     const sent = pushWs(toId, { type: "MESSAGE", message: signed });
@@ -390,12 +432,8 @@ async function deliverToAgent(toId: AgentId, message: Message): Promise<Delivery
   }
 
   // 2. Webhook — for non-interactive agents
-  const peer = db.query(
-    "SELECT transport_type, transport_webhook_url FROM peers WHERE id = ?"
-  ).get(toId) as { transport_type: string; transport_webhook_url: string | null } | null;
-
-  if (peer?.transport_type === "webhook" && peer.transport_webhook_url) {
-    const ok = await deliverWebhook(peer.transport_webhook_url, signed);
+  if (peerRow?.transport_type === "webhook" && peerRow.transport_webhook_url) {
+    const ok = await deliverWebhook(peerRow.transport_webhook_url, signed);
     if (ok) {
       if (message.qos === 0) markDelivered.run(message.id);
       return "webhook";
@@ -535,6 +573,7 @@ function hydrateAgent(row: any): Agent {
     online: wsConnections.has(row.id),
     registered_at: row.registered_at,
     last_seen: row.last_seen,
+    broker_url: row.broker_url ?? null,
   };
 }
 
@@ -601,6 +640,10 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     now,
     now,
   );
+
+  // Notify federation peers about the new agent
+  const newAgent = hydrateAgent(db.query("SELECT * FROM peers WHERE id = ?").get(id) as any);
+  fedNotifyAgentUpdate(newAgent);
 
   return { id, token };
 }
@@ -732,6 +775,24 @@ async function handleBroadcast(
     `, [body.topic, body.from_id, body.text, qos, new Date().toISOString()]);
   }
 
+  // Forward to all federation peers (loop-safe: peers don't re-forward FED_BROADCAST)
+  if (fedPeers.size > 0 || fedServerConnections.size > 0) {
+    const fedFrame: FedClientFrame = {
+      type: "FED_BROADCAST",
+      origin_broker_id: BROKER_ID,
+      topic: body.topic,
+      from_id: body.from_id,
+      text: body.text,
+      qos,
+      retain: !!body.retain,
+    };
+    broadcastToFederation(fedFrame);
+    // Also send to server-side federation connections
+    for (const [, ws] of fedServerConnections) {
+      ws.send(JSON.stringify(fedFrame));
+    }
+  }
+
   return { ok: true, delivered_to: deliveredTo };
 }
 
@@ -805,6 +866,335 @@ function handleGetDeadLetters(body: GetDeadLettersRequest): GetDeadLettersRespon
 function handleUnregister(body: { id: string }): void {
   removePeer(body.id);
 }
+
+// ---------------------------------------------------------------------------
+// Federation — broker-to-broker WS connections
+// ---------------------------------------------------------------------------
+
+type FedPeer = {
+  url: string;
+  broker_id: BrokerId | null;
+  ws: WebSocket | null;
+  connected: boolean;
+  reconnect_delay: number;
+  reconnect_timer: ReturnType<typeof setTimeout> | null;
+};
+
+const FED_RECONNECT_BASE_MS = 5_000;
+const FED_RECONNECT_MAX_MS = 120_000;
+const FED_HEARTBEAT_MS = 20_000;
+
+// Map<peer_url, FedPeer>
+const fedPeers = new Map<string, FedPeer>();
+
+function fedLog(msg: string) {
+  log(`[fed] ${msg}`);
+}
+
+function fedSend(peer: FedPeer, frame: FedClientFrame): boolean {
+  if (!peer.ws || peer.ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    peer.ws.send(JSON.stringify(frame));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Remove all agents that were sourced from a given broker URL */
+function purgeFederatedAgents(brokerUrl: string) {
+  const rows = db.query("SELECT id FROM peers WHERE broker_url = ?").all(brokerUrl) as { id: string }[];
+  for (const row of rows) {
+    db.run("DELETE FROM peers WHERE id = ?", [row.id]);
+    db.run("DELETE FROM subscriptions WHERE agent_id = ?", [row.id]);
+  }
+  if (rows.length) fedLog(`Purged ${rows.length} agents from ${brokerUrl}`);
+}
+
+/** Upsert a remote agent into the local peers table */
+function upsertFederatedAgent(agent: Agent, brokerUrl: string) {
+  const existing = db.query("SELECT id FROM peers WHERE id = ?").get(agent.id);
+  if (existing) {
+    db.run(`
+      UPDATE peers SET
+        summary = ?, agent_type = ?, agent_name = ?, capabilities = ?,
+        fleet_id = ?, device_id = ?, hostname = ?,
+        last_seen = ?, broker_url = ?
+      WHERE id = ?
+    `, [
+      agent.summary, agent.agent_type, agent.agent_name,
+      JSON.stringify(agent.capabilities),
+      agent.fleet_id, agent.device_id, agent.hostname,
+      agent.last_seen, brokerUrl, agent.id,
+    ]);
+  } else {
+    const now = new Date().toISOString();
+    db.run(`
+      INSERT INTO peers (
+        id, pid, cwd, git_root, tty, hostname, fleet_id, device_id,
+        summary, agent_type, agent_name, capabilities,
+        transport_type, transport_webhook_url, transport_poll_interval_ms,
+        default_qos, default_ttl_ms, token_hash,
+        lwt_topic, lwt_message, lwt_qos, lwt_retain,
+        registered_at, last_seen, broker_url
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      agent.id, null, agent.cwd, agent.git_root, agent.tty,
+      agent.hostname, agent.fleet_id, agent.device_id,
+      agent.summary, agent.agent_type, agent.agent_name,
+      JSON.stringify(agent.capabilities),
+      agent.transport.type, agent.transport.webhook_url ?? null, agent.transport.poll_interval_ms ?? null,
+      1, null, null,
+      agent.lwt_topic, null, 0, 0,
+      agent.registered_at ?? now, agent.last_seen ?? now,
+      brokerUrl,
+    ]);
+  }
+}
+
+function handleFedFrame(peer: FedPeer, frame: FedBrokerFrame) {
+  switch (frame.type) {
+    case "BROKER_CONNECTED": {
+      peer.broker_id = frame.broker_id;
+      peer.connected = true;
+      peer.reconnect_delay = FED_RECONNECT_BASE_MS;
+      fedLog(`Connected to ${frame.broker_id} at ${peer.url}`);
+      break;
+    }
+
+    case "AGENT_SYNC": {
+      // Replace all agents from this broker with the fresh list
+      purgeFederatedAgents(peer.url);
+      for (const agent of frame.agents) {
+        if (agent.broker_url !== null) continue; // skip already-remote agents (no re-federation)
+        upsertFederatedAgent(agent, peer.url);
+      }
+      fedLog(`Synced ${frame.agents.length} agents from ${peer.url}`);
+      break;
+    }
+
+    case "AGENT_UPDATE": {
+      if (frame.agent.broker_url !== null) break; // don't relay transitive remotes
+      upsertFederatedAgent(frame.agent, peer.url);
+      break;
+    }
+
+    case "AGENT_REMOVE": {
+      db.run("DELETE FROM peers WHERE id = ? AND broker_url = ?", [frame.agent_id, peer.url]);
+      db.run("DELETE FROM subscriptions WHERE agent_id = ?", [frame.agent_id]);
+      break;
+    }
+
+    case "FED_MESSAGE": {
+      const msg = attachSignature({ ...frame.message });
+      // Deliver to the local agent
+      deliverToAgent(msg.to_id, msg).catch(() => {});
+      break;
+    }
+
+    case "FED_BROADCAST": {
+      // Deliver to local subscribers matching topic — do NOT re-forward (loop prevention)
+      const allSubs = selectAllSubscriptions.all() as { agent_id: string; topic: string }[];
+      const localSubs = allSubs.filter(
+        (s) => s.agent_id !== frame.from_id && topicMatches(frame.topic, s.topic)
+      );
+      for (const sub of localSubs) {
+        const localPeer = db.query("SELECT id, broker_url FROM peers WHERE id = ?").get(sub.agent_id) as any;
+        if (!localPeer || localPeer.broker_url !== null) continue; // only local agents
+        const { msg } = insertMessageAndGetId(
+          frame.from_id, sub.agent_id, frame.text, frame.topic, frame.qos as QoS, null, MAX_RETRIES
+        );
+        deliverToAgent(sub.agent_id, msg).catch(() => {});
+      }
+      if (frame.retain) {
+        db.run(`
+          INSERT INTO retained_messages (topic, from_id, text, qos, retained_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(topic) DO UPDATE SET
+            from_id = excluded.from_id, text = excluded.text,
+            qos = excluded.qos, retained_at = excluded.retained_at
+        `, [frame.topic, frame.from_id, frame.text, frame.qos, new Date().toISOString()]);
+      }
+      break;
+    }
+
+    case "PONG":
+      break;
+
+    case "ERROR":
+      fedLog(`Error from ${peer.url}: ${frame.code} — ${frame.message}`);
+      break;
+  }
+}
+
+function connectFedPeer(peer: FedPeer) {
+  if (peer.reconnect_timer) {
+    clearTimeout(peer.reconnect_timer);
+    peer.reconnect_timer = null;
+  }
+
+  const wsUrl = peer.url.replace(/^http/, "ws") + "/ws/federation";
+  fedLog(`Connecting to ${wsUrl}`);
+
+  try {
+    peer.ws = new WebSocket(wsUrl);
+  } catch {
+    scheduleFedReconnect(peer);
+    return;
+  }
+
+  peer.ws.onopen = () => {
+    const secretHash = FLEET_SECRET ? hashToken(FLEET_SECRET) : undefined;
+    const frame: FedClientFrame = {
+      type: "BROKER_CONNECT",
+      broker_id: BROKER_ID,
+      broker_url: BROKER_OWN_URL,
+      fleet_id: FLEET_ID,
+      version: VERSION,
+      ...(secretHash ? { secret_hash: secretHash } : {}),
+    };
+    peer.ws!.send(JSON.stringify(frame));
+  };
+
+  peer.ws.onmessage = (event) => {
+    try {
+      const frame = JSON.parse(event.data as string) as FedBrokerFrame;
+      handleFedFrame(peer, frame);
+    } catch (e) {
+      fedLog(`Parse error from ${peer.url}: ${e}`);
+    }
+  };
+
+  peer.ws.onclose = () => {
+    peer.ws = null;
+    peer.connected = false;
+    purgeFederatedAgents(peer.url);
+    fedLog(`Disconnected from ${peer.url}, will reconnect`);
+    scheduleFedReconnect(peer);
+  };
+
+  peer.ws.onerror = () => {
+    // onclose fires after onerror
+  };
+}
+
+function scheduleFedReconnect(peer: FedPeer) {
+  peer.reconnect_timer = setTimeout(() => {
+    peer.reconnect_delay = Math.min(peer.reconnect_delay * 2, FED_RECONNECT_MAX_MS);
+    connectFedPeer(peer);
+  }, peer.reconnect_delay);
+  fedLog(`Reconnecting to ${peer.url} in ${peer.reconnect_delay}ms`);
+}
+
+/** Broadcast a frame to all connected federation peers */
+function broadcastToFederation(frame: FedClientFrame) {
+  for (const peer of fedPeers.values()) {
+    if (peer.connected) fedSend(peer, frame);
+  }
+}
+
+/** Notify federation peers that a local agent was registered/updated */
+function fedNotifyAgentUpdate(agent: Agent) {
+  broadcastToFederation({ type: "AGENT_UPDATE", agent });
+}
+
+/** Notify federation peers that a local agent was removed */
+function fedNotifyAgentRemove(agentId: AgentId) {
+  broadcastToFederation({ type: "AGENT_REMOVE", agent_id: agentId });
+}
+
+// Federation WS server handler — accepts incoming connections from peer brokers
+type FedServerData = {
+  peer_broker_id: BrokerId | null;
+  peer_broker_url: string | null;
+  authenticated: boolean;
+};
+
+const fedServerConnections = new Map<BrokerId, any>(); // broker_id → ws
+
+function handleFedServerFrame(ws: any, frame: FedClientFrame) {
+  const data = ws.data as FedServerData;
+
+  if (frame.type === "BROKER_CONNECT") {
+    // Auth check: if fleet secret is configured, verify the hash
+    if (FLEET_SECRET && frame.secret_hash !== hashToken(FLEET_SECRET)) {
+      ws.send(JSON.stringify({ type: "ERROR", code: "UNAUTHORIZED", message: "Invalid fleet secret" } satisfies FedBrokerFrame));
+      ws.close();
+      return;
+    }
+
+    data.peer_broker_id = frame.broker_id;
+    data.peer_broker_url = frame.broker_url;
+    data.authenticated = true;
+    fedServerConnections.set(frame.broker_id, ws);
+
+    // Send BROKER_CONNECTED
+    ws.send(JSON.stringify({
+      type: "BROKER_CONNECTED",
+      broker_id: BROKER_ID,
+      broker_url: BROKER_OWN_URL,
+      fleet_id: FLEET_ID,
+    } satisfies FedBrokerFrame));
+
+    // Send full local agent list (local agents only, no re-federation)
+    const localAgents = (selectAllPeers.all() as any[])
+      .filter((r) => !r.broker_url)
+      .map(hydrateAgent);
+    ws.send(JSON.stringify({ type: "AGENT_SYNC", agents: localAgents } satisfies FedBrokerFrame));
+
+    fedLog(`Peer ${frame.broker_id} connected (server-side)`);
+    return;
+  }
+
+  if (!data.authenticated) {
+    ws.send(JSON.stringify({ type: "ERROR", code: "UNAUTHORIZED", message: "Send BROKER_CONNECT first" } satisfies FedBrokerFrame));
+    return;
+  }
+
+  // Relay frames from server-side connections (they mirror client-side logic)
+  const peerUrl = data.peer_broker_url ?? "";
+  const mirroredFrame = frame as unknown as FedBrokerFrame;
+  // Build a synthetic FedPeer for handler reuse
+  const syntheticPeer: FedPeer = {
+    url: peerUrl,
+    broker_id: data.peer_broker_id,
+    ws: null,
+    connected: true,
+    reconnect_delay: FED_RECONNECT_BASE_MS,
+    reconnect_timer: null,
+  };
+
+  switch (frame.type) {
+    case "AGENT_UPDATE":
+      if (!frame.agent.broker_url) upsertFederatedAgent(frame.agent, peerUrl);
+      break;
+    case "AGENT_REMOVE":
+      db.run("DELETE FROM peers WHERE id = ? AND broker_url = ?", [frame.agent_id, peerUrl]);
+      db.run("DELETE FROM subscriptions WHERE agent_id = ?", [frame.agent_id]);
+      break;
+    case "FED_MESSAGE":
+      handleFedFrame(syntheticPeer, { type: "FED_MESSAGE", message: frame.message });
+      break;
+    case "FED_BROADCAST":
+      handleFedFrame(syntheticPeer, frame as unknown as FedBrokerFrame);
+      break;
+    case "PING":
+      ws.send(JSON.stringify({ type: "PONG" } satisfies FedBrokerFrame));
+      break;
+    case "BROKER_DISCONNECT":
+      if (data.peer_broker_id) fedServerConnections.delete(data.peer_broker_id);
+      purgeFederatedAgents(peerUrl);
+      ws.close(1000);
+      break;
+  }
+}
+
+// Federation heartbeat
+setInterval(() => {
+  for (const peer of fedPeers.values()) {
+    if (peer.connected) fedSend(peer, { type: "PING" });
+  }
+}, FED_HEARTBEAT_MS);
 
 // ---------------------------------------------------------------------------
 // A2A Agent Cards
@@ -1005,7 +1395,7 @@ function handleWsFrame(ws: any, frame: WsClientFrame) {
 // HTTP request handler (extracted for clarity)
 // ---------------------------------------------------------------------------
 
-const PUBLIC_ENDPOINTS = new Set(["/register", "/health", "/.well-known/agent.json", "/agent-card", "/agent-cards"]);
+const PUBLIC_ENDPOINTS = new Set(["/register", "/health", "/.well-known/agent.json", "/agent-card", "/agent-cards", "/federation/status"]);
 
 async function handleHttpRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -1103,6 +1493,19 @@ async function handleHttpRequest(req: Request): Promise<Response> {
       case "/unregister":
         handleUnregister(body as { id: string });
         return Response.json({ ok: true });
+      case "/federation/status": {
+        const peers = Array.from(fedPeers.entries()).map(([url, p]) => ({
+          url,
+          broker_id: p.broker_id,
+          connected: p.connected,
+        }));
+        const serverSide = Array.from(fedServerConnections.entries()).map(([id, ws]) => ({
+          broker_id: id,
+          broker_url: (ws.data as FedServerData).peer_broker_url,
+          connected: true,
+        }));
+        return Response.json({ broker_id: BROKER_ID, peers, server_peers: serverSide });
+      }
       case "/verify-signature": {
         const { message, signature } = body as { message: Message; signature: string };
         if (!FLEET_SECRET) return Response.json({ ok: false, error: "Signing not configured on this broker" });
@@ -1121,14 +1524,25 @@ async function handleHttpRequest(req: Request): Promise<Response> {
 // Server (HTTP + WebSocket on same port)
 // ---------------------------------------------------------------------------
 
-Bun.serve<WsData>({
+type WsServerData = WsData | FedServerData;
+
+Bun.serve<WsServerData>({
   port: PORT,
   hostname: BIND,
 
   fetch(req, server) {
-    // WebSocket upgrade
+    const url = new URL(req.url);
     if (req.headers.get("Upgrade") === "websocket") {
-      const ok = server.upgrade(req, { data: { agent_id: null, lwt: null, clean_disconnect: false } });
+      // Federation broker-to-broker connection
+      if (url.pathname === "/ws/federation") {
+        const ok = server.upgrade(req, {
+          data: { peer_broker_id: null, peer_broker_url: null, authenticated: false } satisfies FedServerData,
+        });
+        if (ok) return;
+        return new Response("Federation WebSocket upgrade failed", { status: 400 });
+      }
+      // Regular agent connection
+      const ok = server.upgrade(req, { data: { agent_id: null, lwt: null, clean_disconnect: false } satisfies WsData });
       if (ok) return;
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
@@ -1137,10 +1551,21 @@ Bun.serve<WsData>({
 
   websocket: {
     open(ws) {
-      // Not authenticated yet — wait for CONNECT frame
+      // Not authenticated yet — wait for CONNECT or BROKER_CONNECT frame
     },
 
     message(ws, data) {
+      const d = ws.data as any;
+      // Distinguish federation vs agent connections by data shape
+      if ("peer_broker_id" in d || "authenticated" in d) {
+        try {
+          const frame = JSON.parse(data as string) as FedClientFrame;
+          handleFedServerFrame(ws, frame);
+        } catch (e) {
+          ws.send(JSON.stringify({ type: "ERROR", code: "PARSE_ERROR", message: String(e) } satisfies FedBrokerFrame));
+        }
+        return;
+      }
       try {
         const frame = JSON.parse(data as string) as WsClientFrame;
         handleWsFrame(ws, frame);
@@ -1154,13 +1579,22 @@ Bun.serve<WsData>({
     },
 
     close(ws, code) {
-      const id = ws.data.agent_id;
+      const d = ws.data as any;
+      // Federation peer disconnect
+      if ("peer_broker_id" in d) {
+        const peerId = d.peer_broker_id as BrokerId | null;
+        if (peerId) {
+          fedServerConnections.delete(peerId);
+          if (d.peer_broker_url) purgeFederatedAgents(d.peer_broker_url);
+          fedLog(`Peer ${peerId} disconnected (server-side)`);
+        }
+        return;
+      }
+      // Agent disconnect
+      const id = (d as WsData).agent_id;
       if (!id) return;
-
       wsConnections.delete(id);
-
-      if (!ws.data.clean_disconnect) {
-        // Unexpected disconnect — trigger LWT
+      if (!(d as WsData).clean_disconnect) {
         triggerLwt(id).catch(() => {});
         log(`WS disconnected (unexpected): ${id} (code: ${code})`);
       } else {
@@ -1168,7 +1602,6 @@ Bun.serve<WsData>({
       }
     },
 
-    // Keep-alive ping from Bun's WS layer every 30s
     idleTimeout: 60,
   },
 });
@@ -1224,3 +1657,24 @@ try {
 log(`Listening on ${BIND}:${PORT} (db: ${DB_PATH})`);
 log(`WebSocket: ws://${os.hostname()}:${PORT}/ws`);
 if (FLEET_ID) log(`Fleet: ${FLEET_ID}`);
+log(`Broker ID: ${BROKER_ID}`);
+
+// Start federation connections
+if (FEDERATION_PEERS.length) {
+  log(`Federation peers: ${FEDERATION_PEERS.join(", ")}`);
+  for (const peerUrl of FEDERATION_PEERS) {
+    const peer: FedPeer = {
+      url: peerUrl,
+      broker_id: null,
+      ws: null,
+      connected: false,
+      reconnect_delay: FED_RECONNECT_BASE_MS,
+      reconnect_timer: null,
+    };
+    fedPeers.set(peerUrl, peer);
+    // Stagger initial connections to avoid thundering herd
+    setTimeout(() => connectFedPeer(peer), Math.random() * 2000);
+  }
+} else {
+  log(`Federation: disabled (set AGENTMESH_FEDERATION_PEERS to enable)`);
+}
