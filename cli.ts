@@ -1,18 +1,21 @@
 #!/usr/bin/env bun
 /**
- * claude-peers CLI
+ * agentmesh CLI
  *
- * Utility commands for managing the broker and inspecting peers.
+ * Utility for inspecting and interacting with the agentmesh broker.
  *
  * Usage:
- *   bun cli.ts status          — Show broker status and all peers
- *   bun cli.ts peers           — List all peers
- *   bun cli.ts send <id> <msg> — Send a message to a peer
- *   bun cli.ts kill-broker     — Stop the broker daemon
+ *   bun cli.ts status                       — Broker health + all agents
+ *   bun cli.ts agents [--fleet F] [--online] — List agents
+ *   bun cli.ts send <agent-id> <message>    — Send a direct message
+ *   bun cli.ts broadcast <topic> <message>  — Publish to a topic
+ *   bun cli.ts dead-letters [agent-id]      — Show dead letter queue
+ *
+ * Config (env or defaults):
+ *   AGENTMESH_BROKER_URL  — default http://127.0.0.1:7899
  */
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL = process.env.AGENTMESH_BROKER_URL ?? "http://127.0.0.1:7899";
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
@@ -21,95 +24,87 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }
-    : {};
+    : { method: "GET" };
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
-    signal: AbortSignal.timeout(3000),
+    signal: AbortSignal.timeout(5000),
   });
-  if (!res.ok) {
-    throw new Error(`${res.status}: ${await res.text()}`);
-  }
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
   return res.json() as Promise<T>;
 }
 
-const cmd = process.argv[2];
+function fmtAgent(a: any): string {
+  const lines: string[] = [];
+  const addr = [a.fleet_id, a.device_id, a.agent_name].filter(Boolean).join("/") || a.id;
+  const onlineTag = a.online ? " \x1b[32m●\x1b[0m" : " \x1b[90m○\x1b[0m";
+  lines.push(`  ${a.id}${onlineTag}  [${a.agent_type}]  ${addr}`);
+  if (a.summary) lines.push(`    ${a.summary}`);
+  const meta: string[] = [];
+  if (a.hostname) meta.push(`host:${a.hostname}`);
+  if (a.cwd) meta.push(`cwd:${a.cwd}`);
+  if (a.capabilities?.length) meta.push(`caps:${a.capabilities.join(",")}`);
+  meta.push(`seen:${new Date(a.last_seen).toLocaleString()}`);
+  lines.push(`    ${meta.join("  ")}`);
+  return lines.join("\n");
+}
+
+const [, , cmd, ...rest] = process.argv;
 
 switch (cmd) {
   case "status": {
     try {
-      const health = await brokerFetch<{ status: string; peers: number }>("/health");
-      console.log(`Broker: ${health.status} (${health.peers} peer(s) registered)`);
-      console.log(`URL: ${BROKER_URL}`);
+      const health = await brokerFetch<{ status: string; agents?: number; peers?: number }>("/health");
+      const count = health.agents ?? health.peers ?? 0;
+      console.log(`Broker: \x1b[32m${health.status}\x1b[0m  (${count} agent(s))  ${BROKER_URL}`);
 
-      if (health.peers > 0) {
-        const peers = await brokerFetch<
-          Array<{
-            id: string;
-            pid: number;
-            cwd: string;
-            git_root: string | null;
-            tty: string | null;
-            summary: string;
-            last_seen: string;
-          }>
-        >("/list-peers", {
-          scope: "machine",
-          cwd: "/",
-          git_root: null,
-        });
-
-        console.log("\nPeers:");
-        for (const p of peers) {
-          console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
-          if (p.summary) console.log(`         ${p.summary}`);
-          if (p.tty) console.log(`         TTY: ${p.tty}`);
-          console.log(`         Last seen: ${p.last_seen}`);
+      if (count > 0) {
+        const agents = await brokerFetch<any[]>("/list-peers", { scope: "fleet", cwd: "/", git_root: null });
+        if (agents.length) {
+          console.log("\nAgents:");
+          for (const a of agents) console.log(fmtAgent(a));
         }
       }
-    } catch {
-      console.log("Broker is not running.");
+    } catch (e) {
+      console.error(`Broker unreachable at ${BROKER_URL}: ${e instanceof Error ? e.message : e}`);
+      process.exit(1);
     }
     break;
   }
 
-  case "peers": {
+  case "agents": {
+    // Parse flags: --fleet <id>, --device <id>, --online, --type <type>
+    const flags: Record<string, string | boolean> = {};
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--fleet") flags.fleet_id = rest[++i];
+      else if (rest[i] === "--device") flags.device_id = rest[++i];
+      else if (rest[i] === "--type") flags.agent_type = rest[++i];
+      else if (rest[i] === "--online") flags.online_only = true;
+    }
     try {
-      const peers = await brokerFetch<
-        Array<{
-          id: string;
-          pid: number;
-          cwd: string;
-          git_root: string | null;
-          tty: string | null;
-          summary: string;
-          last_seen: string;
-        }>
-      >("/list-peers", {
-        scope: "machine",
+      const agents = await brokerFetch<any[]>("/list-peers", {
+        scope: "fleet",
         cwd: "/",
         git_root: null,
+        ...flags,
       });
-
-      if (peers.length === 0) {
-        console.log("No peers registered.");
+      if (!agents.length) {
+        console.log("No agents found.");
       } else {
-        for (const p of peers) {
-          const parts = [`${p.id}  PID:${p.pid}  ${p.cwd}`];
-          if (p.summary) parts.push(`  Summary: ${p.summary}`);
-          console.log(parts.join("\n"));
-        }
+        console.log(`${agents.length} agent(s):\n`);
+        for (const a of agents) console.log(fmtAgent(a));
       }
-    } catch {
-      console.log("Broker is not running.");
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : e}`);
+      process.exit(1);
     }
     break;
   }
 
   case "send": {
-    const toId = process.argv[3];
-    const msg = process.argv.slice(4).join(" ");
+    const [toId, ...msgParts] = rest;
+    const msg = msgParts.join(" ");
     if (!toId || !msg) {
-      console.error("Usage: bun cli.ts send <peer-id> <message>");
+      console.error("Usage: bun cli.ts send <agent-id> <message>");
       process.exit(1);
     }
     try {
@@ -117,45 +112,81 @@ switch (cmd) {
         from_id: "cli",
         to_id: toId,
         text: msg,
+        qos: 1,
       });
       if (result.ok) {
         console.log(`Message sent to ${toId}`);
       } else {
         console.error(`Failed: ${result.error}`);
+        process.exit(1);
       }
     } catch (e) {
-      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`Error: ${e instanceof Error ? e.message : e}`);
+      process.exit(1);
     }
     break;
   }
 
-  case "kill-broker": {
+  case "broadcast": {
+    const [topic, ...msgParts] = rest;
+    const msg = msgParts.join(" ");
+    if (!topic || !msg) {
+      console.error("Usage: bun cli.ts broadcast <topic> <message>");
+      process.exit(1);
+    }
     try {
-      const health = await brokerFetch<{ status: string; peers: number }>("/health");
-      console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
-      // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-      const pids = new TextDecoder()
-        .decode(proc.stdout)
-        .trim()
-        .split("\n")
-        .filter((p) => p);
-      for (const pid of pids) {
-        process.kill(parseInt(pid), "SIGTERM");
+      const result = await brokerFetch<{ ok: boolean; delivered_to?: string[]; error?: string }>("/broadcast", {
+        from_id: "cli",
+        topic,
+        text: msg,
+        qos: 1,
+      });
+      if (result.ok) {
+        console.log(`Broadcast to "${topic}" — ${result.delivered_to?.length ?? 0} recipient(s)`);
+      } else {
+        console.error(`Failed: ${result.error}`);
+        process.exit(1);
       }
-      console.log("Broker stopped.");
-    } catch {
-      console.log("Broker is not running.");
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : e}`);
+      process.exit(1);
+    }
+    break;
+  }
+
+  case "dead-letters": {
+    const agentId = rest[0];
+    if (!agentId) {
+      console.error("Usage: bun cli.ts dead-letters <agent-id>");
+      process.exit(1);
+    }
+    try {
+      const result = await brokerFetch<{ dead_letters: any[] }>("/dead-letters", { id: agentId, limit: 50 });
+      if (!result.dead_letters.length) {
+        console.log("No dead letters.");
+      } else {
+        for (const d of result.dead_letters) {
+          console.log(`  From ${d.from_id}${d.topic ? ` [${d.topic}]` : ""} — ${d.reason} (${d.failed_at})`);
+          console.log(`    ${d.text}`);
+        }
+      }
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : e}`);
+      process.exit(1);
     }
     break;
   }
 
   default:
-    console.log(`claude-peers CLI
+    console.log(`agentmesh CLI
 
 Usage:
-  bun cli.ts status          Show broker status and all peers
-  bun cli.ts peers           List all peers
-  bun cli.ts send <id> <msg> Send a message to a peer
-  bun cli.ts kill-broker     Stop the broker daemon`);
+  bun cli.ts status                         Broker health + all agents
+  bun cli.ts agents [--fleet F] [--online]  List agents (flags: --fleet, --device, --type, --online)
+  bun cli.ts send <agent-id> <message>      Send a direct message
+  bun cli.ts broadcast <topic> <message>    Publish to a topic
+  bun cli.ts dead-letters <agent-id>        Show dead letter queue
+
+Config:
+  AGENTMESH_BROKER_URL  Broker URL (default: http://127.0.0.1:7899)`);
 }
