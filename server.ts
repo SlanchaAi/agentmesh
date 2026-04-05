@@ -1,15 +1,18 @@
 #!/usr/bin/env bun
 /**
- * agentmesh MCP server
+ * agentmesh MCP server v0.2.0
  *
- * Spawned as a stdio MCP server (one per Claude Code session).
- * Connects to the agentmesh broker for agent discovery, messaging, and topic pub/sub.
- * Declares claude/channel capability to push inbound messages immediately.
+ * MCP stdio adapter for Claude Code instances connecting to the agentmesh broker.
+ * Uses WebSocket for instant push delivery, falls back to HTTP polling when WS unavailable.
  *
  * Configuration:
- *   AGENTMESH_BROKER_URL  — broker URL (default: http://127.0.0.1:7899)
- *   AGENTMESH_AGENT_NAME  — this agent's display name (default: "claude-code")
- *   AGENTMESH_CAPABILITIES — comma-separated capabilities (default: "")
+ *   AGENTMESH_BROKER_URL   — broker HTTP URL (default: http://127.0.0.1:7899)
+ *   AGENTMESH_AGENT_NAME   — display name (default: "claude-code")
+ *   AGENTMESH_CAPABILITIES — comma-separated capability list
+ *   AGENTMESH_FLEET_ID     — fleet namespace (e.g. "production")
+ *   AGENTMESH_DEVICE_ID    — device identifier within fleet
+ *   AGENTMESH_LWT_TOPIC    — Last Will and Testament topic (e.g. "fleet/agents/status")
+ *   AGENTMESH_LWT_MESSAGE  — LWT message payload (default: JSON with agent_id + offline)
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -21,36 +24,55 @@ import {
 import type {
   AgentId,
   Agent,
+  QoS,
   RegisterResponse,
-  PollMessagesResponse,
   PeekMessagesResponse,
   Message,
+  WsClientFrame,
+  WsBrokerFrame,
 } from "./shared/types.ts";
 
-// --- Configuration ---
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 const BROKER_URL = process.env.AGENTMESH_BROKER_URL ?? "http://127.0.0.1:7899";
+const BROKER_WS_URL = BROKER_URL.replace(/^http/, "ws") + "/ws";
 const AGENT_NAME = process.env.AGENTMESH_AGENT_NAME ?? "claude-code";
 const CAPABILITIES = (process.env.AGENTMESH_CAPABILITIES ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const POLL_INTERVAL_MS = 1000;
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const FLEET_ID = process.env.AGENTMESH_FLEET_ID ?? undefined;
+const DEVICE_ID = process.env.AGENTMESH_DEVICE_ID ?? undefined;
+const LWT_TOPIC = process.env.AGENTMESH_LWT_TOPIC ?? undefined;
+const HTTP_POLL_INTERVAL_MS = 2000;  // fallback polling when WS unavailable
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 30_000;
 
-// --- State ---
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 let myId: AgentId | null = null;
 let myToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
-// Track message IDs we've already attempted to push via notification.
-// Messages are NOT acked in the broker until check_messages is called,
-// so this set prevents re-pushing the same message every poll cycle.
+// Track message IDs pushed via WS/channel — don't re-push same message
 const pushedMessageIds = new Set<number>();
 
-// --- Broker communication ---
+// WS state
+let ws: WebSocket | null = null;
+let wsConnected = false;
+let wsReconnectDelay = WS_RECONNECT_BASE_MS;
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Poll timer — active only when WS is unavailable
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+// ---------------------------------------------------------------------------
+// Broker HTTP
+// ---------------------------------------------------------------------------
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -60,24 +82,208 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Broker error (${path}): ${res.status} ${err}`);
-  }
+  if (!res.ok) throw new Error(`Broker error (${path}): ${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
 }
 
 async function isBrokerAlive(): Promise<boolean> {
   try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(3000) });
     return res.ok;
   } catch {
     return false;
   }
 }
 
-// --- Utility ---
+// ---------------------------------------------------------------------------
+// Inbound message handler (shared by WS push and HTTP poll)
+// ---------------------------------------------------------------------------
+
+async function handleInboundMessage(msg: Message) {
+  if (pushedMessageIds.has(msg.id)) return;
+
+  let fromAgentName = "";
+  let fromSummary = "";
+  let fromCwd = "";
+
+  try {
+    const agents = await brokerFetch<Agent[]>("/list-peers", {
+      scope: "machine",
+      cwd: myCwd,
+      git_root: myGitRoot,
+    });
+    const sender = agents.find((a) => a.id === msg.from_id);
+    if (sender) {
+      fromAgentName = sender.agent_name ?? "";
+      fromSummary = sender.summary;
+      fromCwd = sender.cwd ?? "";
+    }
+  } catch {
+    // Non-critical — proceed without sender context
+  }
+
+  try {
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: msg.text,
+        meta: {
+          from_id: msg.from_id,
+          from_agent_name: fromAgentName,
+          from_summary: fromSummary,
+          from_cwd: fromCwd,
+          topic: msg.topic ?? null,
+          qos: msg.qos,
+          sent_at: msg.sent_at,
+          fleet_id: FLEET_ID ?? null,
+          device_id: DEVICE_ID ?? null,
+        },
+      },
+    });
+    pushedMessageIds.add(msg.id);
+    log(`Pushed message ${msg.id} from ${msg.from_id}${msg.topic ? ` [${msg.topic}]` : ""}`);
+  } catch {
+    log(`Channel push failed for message ${msg.id} — will retry`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket client
+// ---------------------------------------------------------------------------
+
+function connectWebSocket() {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+
+  try {
+    ws = new WebSocket(BROKER_WS_URL);
+  } catch {
+    scheduleWsReconnect();
+    return;
+  }
+
+  ws.onopen = () => {
+    log("WS connected to broker");
+    if (!myId || !myToken) return;
+
+    const lwtMessage = LWT_TOPIC
+      ? (process.env.AGENTMESH_LWT_MESSAGE ?? JSON.stringify({ agent_id: myId, agent_name: AGENT_NAME, status: "offline" }))
+      : undefined;
+
+    const frame: WsClientFrame = {
+      type: "CONNECT",
+      agent_id: myId,
+      token: myToken,
+      ...(LWT_TOPIC && lwtMessage ? {
+        lwt: { topic: LWT_TOPIC, message: lwtMessage, qos: 1, retain: true }
+      } : {}),
+    };
+    ws!.send(JSON.stringify(frame));
+  };
+
+  ws.onmessage = async (event) => {
+    try {
+      const frame = JSON.parse(event.data as string) as WsBrokerFrame;
+
+      if (frame.type === "CONNECTED") {
+        wsConnected = true;
+        wsReconnectDelay = WS_RECONNECT_BASE_MS;
+        log(`WS authenticated as ${frame.agent_id}`);
+        stopPolling(); // WS push is now active — no need to poll
+
+        // Announce online if LWT topic configured
+        if (LWT_TOPIC && myId) {
+          brokerFetch("/broadcast", {
+            from_id: myId,
+            topic: LWT_TOPIC,
+            text: JSON.stringify({ agent_id: myId, agent_name: AGENT_NAME, status: "online" }),
+            qos: 1,
+            retain: true,
+          }).catch(() => {});
+        }
+
+      } else if (frame.type === "MESSAGE") {
+        const msg = frame.message;
+        await handleInboundMessage(msg);
+        // ACK for QoS ≥ 1 — confirm receipt to broker
+        if (msg.qos >= 1 && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ACK", message_id: msg.id } satisfies WsClientFrame));
+          pushedMessageIds.delete(msg.id); // message fully acked, clean up tracking
+        }
+
+      } else if (frame.type === "PONG") {
+        // keepalive confirmed
+      } else if (frame.type === "ERROR") {
+        log(`Broker WS error: ${frame.code} — ${frame.message}`);
+        if (frame.code === "UNAUTHORIZED") {
+          ws?.close();
+        }
+      }
+    } catch (e) {
+      log(`WS message parse error: ${e}`);
+    }
+  };
+
+  ws.onclose = (event) => {
+    ws = null;
+    wsConnected = false;
+    if (event.code !== 1000) {
+      // Unexpected close — start HTTP polling as fallback
+      startPolling();
+      scheduleWsReconnect();
+    }
+  };
+
+  ws.onerror = () => {
+    // onclose will fire after onerror
+  };
+}
+
+function scheduleWsReconnect() {
+  log(`WS reconnecting in ${wsReconnectDelay}ms`);
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, WS_RECONNECT_MAX_MS);
+    connectWebSocket();
+  }, wsReconnectDelay);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP poll fallback (active when WS unavailable)
+// ---------------------------------------------------------------------------
+
+async function pollAndPushMessages() {
+  if (!myId || wsConnected) return;
+
+  try {
+    const result = await brokerFetch<PeekMessagesResponse>("/peek-messages", { id: myId });
+    for (const msg of result.messages) {
+      await handleInboundMessage(msg);
+    }
+  } catch (e) {
+    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+function startPolling() {
+  if (pollTimer || wsConnected) return;
+  pollTimer = setInterval(pollAndPushMessages, HTTP_POLL_INTERVAL_MS);
+  log("HTTP polling started (WS fallback)");
+}
+
+function stopPolling() {
+  if (!pollTimer) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+  log("HTTP polling stopped (WS active)");
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
 
 function log(msg: string) {
   console.error(`[agentmesh] ${msg}`);
@@ -86,16 +292,11 @@ function log(msg: string) {
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
+      cwd, stdout: "pipe", stderr: "ignore",
     });
     const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) return text.trim();
-  } catch {
-    // not a git repo
-  }
+    if (await proc.exited === 0) return text.trim();
+  } catch {}
   return null;
 }
 
@@ -107,336 +308,267 @@ function getTty(): string | null {
       const tty = new TextDecoder().decode(proc.stdout).trim();
       if (tty && tty !== "?" && tty !== "??") return tty;
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return null;
 }
 
-// --- MCP Server ---
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
 
 const mcp = new Server(
-  { name: "agentmesh", version: "0.1.0" },
+  { name: "agentmesh", version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the agentmesh network. Other agents (Claude Code, OpenClaw, Hermes, custom) can see you and send you messages.
+    instructions: `You are connected to the agentmesh network — a private mesh for heterogeneous agents (Claude Code, OpenClaw, Hermes, custom) across a fleet of devices.
 
-IMPORTANT: When you receive a <channel source="agentmesh" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply using send_message, then resume your work. Treat incoming messages like a coworker tapping you on the shoulder.
+IMPORTANT: When you receive a <channel source="agentmesh" ...> message, RESPOND IMMEDIATELY. Pause your current task, reply using send_message, then resume. Treat it like a coworker tapping you on the shoulder.
 
-Read the from_id, from_agent_name, from_summary, and topic attributes to understand who sent the message and on what topic.
+Read from_id, from_agent_name, from_summary, topic, fleet_id, device_id from the message meta.
 
 Available tools:
-- list_agents: Discover other agents on the mesh (filter by scope, agent_type, capabilities)
+- list_agents: Discover agents (filter by scope, fleet, device, agent_type, capabilities, online_only)
 - send_message: Send a direct message to an agent by ID
-- broadcast: Publish a message to a named topic (all subscribers receive it)
-- subscribe: Subscribe to a named topic
+- broadcast: Publish to a topic (all subscribers receive it; supports MQTT wildcards on subscribe)
+- subscribe: Subscribe to a topic (+ = one level, # = all levels)
 - unsubscribe: Unsubscribe from a topic
-- set_summary: Set a 1-2 sentence summary of what you're working on
-- check_messages: Manually check for new messages (fallback if channel push is unavailable)
+- set_summary: Describe what you're working on (visible to all peers)
+- check_messages: Reliably retrieve pending messages (ACKs on return — use this if channel push seems slow)
+- get_dead_letters: Retrieve messages that could not be delivered after max retries
 
-When you start, proactively call set_summary to describe what you're working on.`,
+Topic conventions:
+  {fleet}/{device}/{name}  — e.g. "prod/edge-42/status"
+  +  — matches any single segment
+  #  — matches all remaining segments (must be last)
+
+Call set_summary at session start. If LWT is configured, an "offline" message is published automatically on disconnect.`,
   }
 );
 
-// --- Tool definitions ---
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
 
 const TOOLS = [
   {
     name: "list_agents",
-    description:
-      "List agents registered on the agentmesh. Supports filtering by scope, agent_type, or capabilities.",
+    description: "Discover agents on the mesh. Filter by scope, fleet, device, agent_type, capabilities, or online status.",
     inputSchema: {
       type: "object" as const,
       properties: {
         scope: {
           type: "string" as const,
-          enum: ["machine", "directory", "repo"],
-          description: '"machine" = all agents on this host. "directory" = same cwd. "repo" = same git repo.',
+          enum: ["machine", "directory", "repo", "fleet", "device"],
+          description: '"machine" = all on this host | "fleet" = same fleet_id | "device" = same device_id | "repo"/"directory" = git/cwd scope',
         },
-        agent_type: {
-          type: "string" as const,
-          enum: ["claude-code", "openclaw", "hermes", "custom"],
-          description: "Filter to a specific agent type (optional)",
-        },
+        fleet_id: { type: "string" as const, description: "Filter by fleet" },
+        device_id: { type: "string" as const, description: "Filter by device" },
+        agent_type: { type: "string" as const, enum: ["claude-code", "openclaw", "hermes", "custom"] },
         capabilities: {
           type: "array" as const,
           items: { type: "string" as const },
-          description: "Filter to agents that have all of these capabilities (optional)",
+          description: "Filter to agents with ALL these capabilities",
         },
+        online_only: { type: "boolean" as const, description: "Only return WebSocket-connected agents" },
       },
       required: ["scope"],
     },
   },
   {
     name: "send_message",
-    description: "Send a direct message to another agent by ID.",
+    description: "Send a direct message to an agent by ID.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        to_id: {
-          type: "string" as const,
-          description: "The agent ID to send to (from list_agents)",
-        },
-        message: {
-          type: "string" as const,
-          description: "The message text",
-        },
+        to_id: { type: "string" as const, description: "Agent ID (from list_agents)" },
+        message: { type: "string" as const },
+        qos: { type: "number" as const, description: "0=fire-and-forget, 1=at-least-once (default)" },
       },
       required: ["to_id", "message"],
     },
   },
   {
     name: "broadcast",
-    description: "Publish a message to a named topic. All agents subscribed to that topic receive it.",
+    description: "Publish a message to a topic. All agents subscribed (including wildcard patterns) receive it.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        topic: {
-          type: "string" as const,
-          description: 'Topic name (e.g. "deploys", "alerts", "code-review")',
-        },
-        message: {
-          type: "string" as const,
-          description: "The message text",
-        },
+        topic: { type: "string" as const, description: 'e.g. "prod/edge-42/alerts" or "fleet/all/shutdown"' },
+        message: { type: "string" as const },
+        qos: { type: "number" as const, description: "0 or 1 (default 1)" },
+        retain: { type: "boolean" as const, description: "Store as retained — new subscribers receive it immediately" },
       },
       required: ["topic", "message"],
     },
   },
   {
     name: "subscribe",
-    description: "Subscribe to a named topic to receive broadcast messages sent to it.",
+    description: "Subscribe to a topic. Supports MQTT wildcards: + (one level) and # (all remaining levels).",
     inputSchema: {
       type: "object" as const,
       properties: {
-        topic: {
-          type: "string" as const,
-          description: "Topic name to subscribe to",
-        },
+        topic: { type: "string" as const, description: 'e.g. "prod/+/alerts" or "fleet/#"' },
       },
       required: ["topic"],
     },
   },
   {
     name: "unsubscribe",
-    description: "Unsubscribe from a named topic.",
+    description: "Unsubscribe from a topic.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        topic: {
-          type: "string" as const,
-          description: "Topic name to unsubscribe from",
-        },
+        topic: { type: "string" as const },
       },
       required: ["topic"],
     },
   },
   {
     name: "set_summary",
-    description: "Set a brief summary of what you are working on. Visible to other agents via list_agents.",
+    description: "Set a 1-2 sentence summary of what you are doing. Visible to all peers via list_agents.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        summary: {
-          type: "string" as const,
-          description: "1-2 sentence summary of your current work",
-        },
+        summary: { type: "string" as const },
       },
       required: ["summary"],
     },
   },
   {
     name: "check_messages",
-    description: "Manually check for new messages. Fallback if channel push is not available.",
+    description: "Reliably retrieve pending messages and ACK them. Use this if you suspect channel push is delayed.",
+    inputSchema: { type: "object" as const, properties: {} },
+  },
+  {
+    name: "get_dead_letters",
+    description: "Retrieve messages that failed delivery after max retries or TTL expiry.",
     inputSchema: {
       type: "object" as const,
-      properties: {},
+      properties: {
+        limit: { type: "number" as const, description: "Max results (default 50)" },
+      },
     },
   },
 ];
-
-// --- Tool handlers ---
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
+  const notRegistered = { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+  const err = (e: unknown) => ({
+    content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+    isError: true,
+  });
+
   switch (name) {
     case "list_agents": {
-      const { scope, agent_type, capabilities } = args as {
-        scope: "machine" | "directory" | "repo";
-        agent_type?: string;
-        capabilities?: string[];
-      };
+      const { scope, fleet_id, device_id, agent_type, capabilities, online_only } = args as any;
       try {
         const agents = await brokerFetch<Agent[]>("/list-peers", {
-          scope,
-          cwd: myCwd,
-          git_root: myGitRoot,
-          exclude_id: myId,
-          agent_type,
-          capabilities,
+          scope, cwd: myCwd, git_root: myGitRoot, exclude_id: myId,
+          fleet_id, device_id, agent_type, capabilities, online_only,
         });
-
-        if (agents.length === 0) {
-          return { content: [{ type: "text" as const, text: `No agents found (scope: ${scope}).` }] };
-        }
+        if (!agents.length) return { content: [{ type: "text" as const, text: `No agents found (scope: ${scope}).` }] };
 
         const lines = agents.map((a) => {
-          const parts = [
-            `ID: ${a.id}`,
-            `Type: ${a.agent_type} — ${a.agent_name}`,
-          ];
+          const parts = [`ID: ${a.id}`, `Type: ${a.agent_type} — ${a.agent_name}`];
+          if (a.fleet_id) parts.push(`Fleet: ${a.fleet_id}`);
+          if (a.device_id) parts.push(`Device: ${a.device_id}`);
           if (a.capabilities?.length) parts.push(`Capabilities: ${a.capabilities.join(", ")}`);
           if (a.summary) parts.push(`Summary: ${a.summary}`);
-          parts.push(`Host: ${a.hostname}`);
-          if (a.cwd) parts.push(`CWD: ${a.cwd}`);
-          parts.push(`Last seen: ${a.last_seen}`);
+          parts.push(`Online: ${a.online ? "yes (WS)" : "no"} | Host: ${a.hostname} | Seen: ${a.last_seen}`);
           return parts.join("\n  ");
         });
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Found ${agents.length} agent(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
-          }],
-        };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error listing agents: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+        return { content: [{ type: "text" as const, text: `Found ${agents.length} agent(s) (scope: ${scope}):\n\n${lines.join("\n\n")}` }] };
+      } catch (e) { return err(e); }
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
-      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      if (!myId) return notRegistered;
+      const { to_id, message, qos } = args as { to_id: string; message: string; qos?: QoS };
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-          from_id: myId,
-          to_id,
-          text: message,
+          from_id: myId, to_id, text: message, qos,
         });
-        if (!result.ok) {
-          return { content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }], isError: true };
-        }
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
         return { content: [{ type: "text" as const, text: `Message sent to ${to_id}` }] };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+      } catch (e) { return err(e); }
     }
 
     case "broadcast": {
-      const { topic, message } = args as { topic: string; message: string };
-      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      if (!myId) return notRegistered;
+      const { topic, message, qos, retain } = args as { topic: string; message: string; qos?: QoS; retain?: boolean };
       try {
         const result = await brokerFetch<{ ok: boolean; delivered_to?: string[]; error?: string }>("/broadcast", {
-          from_id: myId,
-          topic,
-          text: message,
+          from_id: myId, topic, text: message, qos, retain,
         });
-        if (!result.ok) {
-          return { content: [{ type: "text" as const, text: `Broadcast failed: ${result.error}` }], isError: true };
-        }
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Broadcast to topic "${topic}" — ${result.delivered_to?.length ?? 0} recipient(s)`,
-          }],
-        };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Broadcast failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Broadcast to "${topic}" — ${result.delivered_to?.length ?? 0} recipient(s)` }] };
+      } catch (e) { return err(e); }
     }
 
     case "subscribe": {
+      if (!myId) return notRegistered;
       const { topic } = args as { topic: string };
-      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
       try {
         await brokerFetch("/subscribe", { id: myId, topic });
-        return { content: [{ type: "text" as const, text: `Subscribed to topic "${topic}"` }] };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+        return { content: [{ type: "text" as const, text: `Subscribed to "${topic}"` }] };
+      } catch (e) { return err(e); }
     }
 
     case "unsubscribe": {
+      if (!myId) return notRegistered;
       const { topic } = args as { topic: string };
-      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
       try {
         await brokerFetch("/unsubscribe", { id: myId, topic });
-        return { content: [{ type: "text" as const, text: `Unsubscribed from topic "${topic}"` }] };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+        return { content: [{ type: "text" as const, text: `Unsubscribed from "${topic}"` }] };
+      } catch (e) { return err(e); }
     }
 
     case "set_summary": {
+      if (!myId) return notRegistered;
       const { summary } = args as { summary: string };
-      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
         return { content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }] };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+      } catch (e) { return err(e); }
     }
 
     case "check_messages": {
-      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      if (!myId) return notRegistered;
       try {
-        // Peek without consuming, then ACK after returning to Claude — guaranteed delivery path
         const result = await brokerFetch<PeekMessagesResponse>("/peek-messages", { id: myId });
-        if (result.messages.length === 0) {
-          return { content: [{ type: "text" as const, text: "No new messages." }] };
-        }
+        if (!result.messages.length) return { content: [{ type: "text" as const, text: "No pending messages." }] };
 
         const lines = result.messages.map(
-          (m) => `From ${m.from_id}${m.topic ? ` [${m.topic}]` : ""} (${m.sent_at}):\n${m.text}`
+          (m) => `From ${m.from_id}${m.topic ? ` [${m.topic}]` : ""} (QoS ${m.qos}, ${m.sent_at}):\n${m.text}`
         );
+        const ids = result.messages.map((m) => m.id);
 
-        // ACK all messages — Claude has received them via this tool response
-        const messageIds = result.messages.map((m) => m.id);
-        await brokerFetch("/ack-messages", { id: myId, message_ids: messageIds })
-          .catch(() => { /* non-critical */ });
+        // ACK — message delivered to Claude via tool response (guaranteed path)
+        await brokerFetch("/ack-messages", { id: myId, message_ids: ids }).catch(() => {});
+        for (const id of ids) pushedMessageIds.delete(id);
 
-        // Clear from local push tracking
-        for (const id of messageIds) {
-          pushedMessageIds.delete(id);
-        }
+        return { content: [{ type: "text" as const, text: `${result.messages.length} message(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+      } catch (e) { return err(e); }
+    }
 
-        return {
-          content: [{
-            type: "text" as const,
-            text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
-          }],
-        };
-      } catch (e) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
-          isError: true,
-        };
-      }
+    case "get_dead_letters": {
+      if (!myId) return notRegistered;
+      const { limit } = args as { limit?: number };
+      try {
+        const result = await brokerFetch<{ dead_letters: any[] }>("/dead-letters", { id: myId, limit });
+        if (!result.dead_letters.length) return { content: [{ type: "text" as const, text: "No dead letters." }] };
+        const lines = result.dead_letters.map(
+          (d) => `From ${d.from_id}${d.topic ? ` [${d.topic}]` : ""} (${d.failed_at}) — ${d.reason}:\n${d.text}`
+        );
+        return { content: [{ type: "text" as const, text: `${result.dead_letters.length} dead letter(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+      } catch (e) { return err(e); }
     }
 
     default:
@@ -444,87 +576,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop ---
-// Uses peek (no side effects) + best-effort channel push.
-// Messages are NOT consumed here — only check_messages (tool call) acks them.
-// This ensures messages are never lost if the channel push doesn't surface in
-// the LLM's context. See: https://github.com/SlanchaAi/agentmesh/issues/ACK
-
-const pushedMessageIds = new Set<number>();
-
-async function pollAndPushMessages() {
-  if (!myId) return;
-
-  try {
-    // Peek — does NOT mark messages as delivered in the broker.
-    // Messages stay undelivered until explicitly acked via check_messages.
-    const result = await brokerFetch<PeekMessagesResponse>("/peek-messages", { id: myId });
-
-    for (const msg of result.messages) {
-      // Skip messages already pushed this session (avoid re-notifying)
-      if (pushedMessageIds.has(msg.id)) continue;
-
-      let fromAgentName = "";
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const agents = await brokerFetch<Agent[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = agents.find((a) => a.id === msg.from_id);
-        if (sender) {
-          fromAgentName = sender.agent_name ?? "";
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical
-      }
-
-      try {
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: msg.text,
-            meta: {
-              from_id: msg.from_id,
-              from_agent_name: fromAgentName,
-              from_summary: fromSummary,
-              from_cwd: fromCwd,
-              topic: msg.topic ?? null,
-              sent_at: msg.sent_at,
-            },
-          },
-        });
-        pushedMessageIds.add(msg.id);
-        log(`Pushed message ${msg.id} from ${msg.from_id}${msg.topic ? ` [${msg.topic}]` : ""}`);
-      } catch {
-        // Push failed — message stays unacked, will retry next poll cycle
-        log(`Push failed for message ${msg.id}, will retry`);
-      }
-    }
-  } catch (e) {
-    log(`Peek error: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
-// --- Startup ---
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
 
 async function main() {
-  // 1. Verify broker is reachable
   if (!(await isBrokerAlive())) {
     throw new Error(`Cannot reach agentmesh broker at ${BROKER_URL}. Is it running?`);
   }
   log(`Broker reachable at ${BROKER_URL}`);
 
-  // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
 
-  // 3. Register
+  // Register via HTTP
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
@@ -532,44 +598,52 @@ async function main() {
     tty,
     hostname: require("os").hostname(),
     summary: "",
+    fleet_id: FLEET_ID,
+    device_id: DEVICE_ID,
     agent_type: "claude-code",
     agent_name: AGENT_NAME,
     capabilities: CAPABILITIES,
-    transport: { type: "channel" },
+    transport: { type: "websocket" },
+    default_qos: 1,
   });
   myId = reg.id;
   myToken = reg.token;
   log(`Registered as ${AGENT_NAME} (${myId})`);
 
-  // 4. Connect MCP over stdio
+  // Connect MCP stdio
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 5. Poll for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // Start HTTP polling as immediate fallback
+  startPolling();
 
-  // 6. Heartbeat
+  // Attempt WebSocket connection (disables polling on success)
+  connectWebSocket();
+
+  // Heartbeat — keep agent alive in broker registry
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
+    if (!myId) return;
+    try {
+      // Heartbeat via WS ping if connected, otherwise HTTP
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "PING" } satisfies WsClientFrame));
+      } else {
         await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
       }
-    }
+    } catch {}
   }, HEARTBEAT_INTERVAL_MS);
 
-  // 7. Cleanup
+  // Cleanup on exit
   const cleanup = async () => {
-    clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    stopPolling();
+    if (ws) {
+      ws.send(JSON.stringify({ type: "DISCONNECT" } satisfies WsClientFrame));
+      ws.close(1000);
+    }
     if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered");
-      } catch {
-        // Best effort
-      }
+      try { await brokerFetch("/unregister", { id: myId }); } catch {}
+      log("Unregistered");
     }
     process.exit(0);
   };
