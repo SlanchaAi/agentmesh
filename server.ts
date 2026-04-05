@@ -399,13 +399,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "check_messages": {
       if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        // Peek without consuming, then ACK after returning to Claude — guaranteed delivery path
+        const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
         if (result.messages.length === 0) {
           return { content: [{ type: "text" as const, text: "No new messages." }] };
         }
         const lines = result.messages.map(
           (m) => `From ${m.from_id}${m.topic ? ` [${m.topic}]` : ""} (${m.sent_at}):\n${m.text}`
         );
+        // ACK all messages — Claude has received them via this tool response
+        await brokerFetch("/ack-messages", {
+          id: myId,
+          message_ids: result.messages.map((m) => m.id),
+        }).catch(() => { /* non-critical */ });
         return {
           content: [{
             type: "text" as const,
@@ -426,14 +432,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 // --- Polling loop ---
+// Uses peek (no side effects) + best-effort channel push.
+// Messages are NOT consumed here — only check_messages (tool call) acks them.
+// This ensures messages are never lost if the channel push doesn't surface in
+// the LLM's context. See: https://github.com/SlanchaAi/agentmesh/issues/ACK
+
+const pushedMessageIds = new Set<number>();
 
 async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
 
     for (const msg of result.messages) {
+      // Skip messages already pushed this session (avoid re-notifying)
+      if (pushedMessageIds.has(msg.id)) continue;
+
       let fromAgentName = "";
       let fromSummary = "";
       let fromCwd = "";
@@ -445,7 +460,7 @@ async function pollAndPushMessages() {
         });
         const sender = agents.find((a) => a.id === msg.from_id);
         if (sender) {
-          fromAgentName = sender.agent_name;
+          fromAgentName = sender.agent_name ?? "";
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
         }
@@ -453,22 +468,27 @@ async function pollAndPushMessages() {
         // Non-critical
       }
 
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_agent_name: fromAgentName,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            topic: msg.topic ?? null,
-            sent_at: msg.sent_at,
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_agent_name: fromAgentName,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              topic: msg.topic ?? null,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
-
-      log(`Pushed message from ${msg.from_id}${msg.topic ? ` [${msg.topic}]` : ""}: ${msg.text.slice(0, 80)}`);
+        });
+        pushedMessageIds.add(msg.id);
+        log(`Pushed message ${msg.id} from ${msg.from_id}${msg.topic ? ` [${msg.topic}]` : ""}`);
+      } catch {
+        // Push failed — message stays unacked, will retry next poll cycle
+        log(`Push failed for message ${msg.id}, will retry`);
+      }
     }
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
