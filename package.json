@@ -1,0 +1,12 @@
+{
+  "name": "agentmesh-mcp",
+  "version": "0.1.0",
+  "description": "MCP server adapter for the agentmesh universal cross-agent messaging broker",
+  "type": "module",
+  "scripts": {
+    "start": "bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
