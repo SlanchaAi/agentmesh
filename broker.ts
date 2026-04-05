@@ -117,31 +117,47 @@ function validateAuth(req: Request): string | null {
 // --- Stale peer cleanup ---
 
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid, hostname, last_seen FROM peers").all() as {
+  const peers = db.query("SELECT id, pid, hostname, last_seen, agent_type FROM peers").all() as {
     id: string;
     pid: number;
     hostname: string;
     last_seen: string;
+    agent_type: string;
   }[];
   const localHostname = require("os").hostname();
   for (const peer of peers) {
-    if (peer.hostname === "localhost" || peer.hostname === localHostname) {
+    const isLocal = peer.hostname === "localhost" || peer.hostname === localHostname;
+    const isClaudeCode = peer.agent_type === "claude-code";
+
+    if (isLocal && isClaudeCode) {
+      // Claude Code instances have real PIDs — verify liveness
       try {
         process.kill(peer.pid, 0);
       } catch {
-        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-        db.run("DELETE FROM subscriptions WHERE agent_id = ?", [peer.id]);
+        removePeer(peer.id);
       }
-    } else {
+    } else if (!isLocal) {
+      // Remote peers — expire by heartbeat timeout
       const lastSeen = new Date(peer.last_seen).getTime();
       if (Date.now() - lastSeen > 60_000) {
-        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-        db.run("DELETE FROM subscriptions WHERE agent_id = ?", [peer.id]);
+        removePeer(peer.id);
+      }
+    }
+    // Non-claude-code local agents (openclaw, hermes, custom) — skip PID check,
+    // expire by heartbeat timeout instead
+    else {
+      const lastSeen = new Date(peer.last_seen).getTime();
+      if (Date.now() - lastSeen > 60_000) {
+        removePeer(peer.id);
       }
     }
   }
+}
+
+function removePeer(id: string) {
+  db.run("DELETE FROM peers WHERE id = ?", [id]);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+  db.run("DELETE FROM subscriptions WHERE agent_id = ?", [id]);
 }
 
 cleanStalePeers();
@@ -310,16 +326,19 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     });
   }
 
-  // Verify local peers are alive
+  // Verify local claude-code peers are alive (non-claude-code agents skip PID check)
   const localHostname = require("os").hostname();
   rows = rows.filter((p: any) => {
     const ph = p.hostname ?? "localhost";
-    if (ph !== "localhost" && ph !== localHostname) return true;
+    const isLocal = ph === "localhost" || ph === localHostname;
+    const isClaudeCode = (p.agent_type ?? "claude-code") === "claude-code";
+    if (!isLocal) return true; // remote — trust heartbeat
+    if (!isClaudeCode) return true; // non-claude-code local — skip PID check
     try {
       process.kill(p.pid, 0);
       return true;
     } catch {
-      deletePeer.run(p.id);
+      removePeer(p.id);
       return false;
     }
   });
