@@ -25,6 +25,9 @@ import type {
   UnsubscribeRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  PeekMessagesRequest,
+  PeekMessagesResponse,
+  AckMessagesRequest,
   Peer,
   Message,
   AgentType,
@@ -424,6 +427,25 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+function handlePeekMessages(body: PeekMessagesRequest): PeekMessagesResponse {
+  const messages = selectUndelivered.all(body.id) as Message[];
+  // Return without marking delivered — caller must explicitly ack
+  return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
+  let acked = 0;
+  for (const id of body.message_ids) {
+    // Only ack messages belonging to this agent
+    const msg = db.query("SELECT to_id FROM messages WHERE id = ? AND delivered = 0").get(id) as { to_id: string } | null;
+    if (msg && msg.to_id === body.id) {
+      markDelivered.run(id);
+      acked++;
+    }
+  }
+  return { ok: true, acked };
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
   db.run("DELETE FROM subscriptions WHERE agent_id = ?", [body.id]);
@@ -488,6 +510,10 @@ Bun.serve({
           return Response.json(handleUnsubscribe(body as UnsubscribeRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/peek-messages":
+          return Response.json(handlePeekMessages(body as PeekMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

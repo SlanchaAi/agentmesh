@@ -113,3 +113,16 @@ export interface PollMessagesRequest {
 export interface PollMessagesResponse {
   messages: Message[];
 }
+
+export interface PeekMessagesRequest {
+  id: AgentId;
+}
+
+export interface PeekMessagesResponse {
+  messages: Message[];
+}
+
+export interface AckMessagesRequest {
+  id: AgentId;
+  message_ids: number[];
+}

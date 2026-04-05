@@ -23,6 +23,7 @@ import type {
   Agent,
   RegisterResponse,
   PollMessagesResponse,
+  PeekMessagesResponse,
   Message,
 } from "./shared/types.ts";
 
@@ -43,6 +44,11 @@ let myId: AgentId | null = null;
 let myToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+
+// Track message IDs we've already attempted to push via notification.
+// Messages are NOT acked in the broker until check_messages is called,
+// so this set prevents re-pushing the same message every poll cycle.
+const pushedMessageIds = new Set<number>();
 
 // --- Broker communication ---
 
@@ -400,18 +406,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
       try {
         // Peek without consuming, then ACK after returning to Claude — guaranteed delivery path
-        const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
+        const result = await brokerFetch<PeekMessagesResponse>("/peek-messages", { id: myId });
         if (result.messages.length === 0) {
           return { content: [{ type: "text" as const, text: "No new messages." }] };
         }
+
         const lines = result.messages.map(
           (m) => `From ${m.from_id}${m.topic ? ` [${m.topic}]` : ""} (${m.sent_at}):\n${m.text}`
         );
+
         // ACK all messages — Claude has received them via this tool response
-        await brokerFetch("/ack-messages", {
-          id: myId,
-          message_ids: result.messages.map((m) => m.id),
-        }).catch(() => { /* non-critical */ });
+        const messageIds = result.messages.map((m) => m.id);
+        await brokerFetch("/ack-messages", { id: myId, message_ids: messageIds })
+          .catch(() => { /* non-critical */ });
+
+        // Clear from local push tracking
+        for (const id of messageIds) {
+          pushedMessageIds.delete(id);
+        }
+
         return {
           content: [{
             type: "text" as const,
@@ -443,7 +456,9 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
+    // Peek — does NOT mark messages as delivered in the broker.
+    // Messages stay undelivered until explicitly acked via check_messages.
+    const result = await brokerFetch<PeekMessagesResponse>("/peek-messages", { id: myId });
 
     for (const msg of result.messages) {
       // Skip messages already pushed this session (avoid re-notifying)
@@ -491,7 +506,7 @@ async function pollAndPushMessages() {
       }
     }
   } catch (e) {
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    log(`Peek error: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
