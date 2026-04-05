@@ -261,3 +261,48 @@ export interface GetDeadLettersRequest {
 export interface GetDeadLettersResponse {
   dead_letters: DeadLetter[];
 }
+
+// ---------------------------------------------------------------------------
+// A2A Agent Cards (Google Agent-to-Agent protocol)
+// https://google.github.io/A2A/
+// ---------------------------------------------------------------------------
+
+export interface AgentSkill {
+  id: string;
+  name: string;
+  description?: string;
+  tags?: string[];
+  examples?: string[];
+  inputModes?: string[];
+  outputModes?: string[];
+}
+
+export interface AgentCard {
+  name: string;
+  description: string;
+  url: string;              // A2A endpoint (or base broker URL for mesh agents)
+  version: string;
+  provider?: {
+    organization: string;
+    url?: string;
+  };
+  capabilities: {
+    streaming?: boolean;
+    pushNotifications?: boolean;
+    stateTransitionHistory?: boolean;
+  };
+  authentication?: {
+    schemes: string[];
+  };
+  defaultInputModes: string[];
+  defaultOutputModes: string[];
+  skills: AgentSkill[];
+  // agentmesh extensions
+  agentmesh?: {
+    agent_id: AgentId;
+    agent_type: AgentType;
+    fleet_id: string | null;
+    device_id: string | null;
+    online: boolean;
+  };
+}

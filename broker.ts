@@ -44,6 +44,8 @@ import type {
   GetDeadLettersResponse,
   WsClientFrame,
   WsBrokerFrame,
+  AgentCard,
+  AgentSkill,
 } from "./shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -55,7 +57,7 @@ const DISCOVERY_PORT = PORT + 1; // UDP broadcast port
 const DB_PATH = process.env.AGENTMESH_DB ?? process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.agentmesh.db`;
 const BIND = process.env.AGENTMESH_BIND ?? process.env.CLAUDE_PEERS_BIND ?? "0.0.0.0";
 const FLEET_ID = process.env.AGENTMESH_FLEET_ID ?? null;
-const VERSION = "agentmesh/0.2.0";
+const VERSION = "agentmesh/0.3.0";
 
 // QoS 1 retry: wait this long for ACK before retrying
 const ACK_DEADLINE_MS = parseInt(process.env.AGENTMESH_ACK_DEADLINE_MS ?? "60000", 10);
@@ -748,6 +750,117 @@ function handleUnregister(body: { id: string }): void {
 }
 
 // ---------------------------------------------------------------------------
+// A2A Agent Cards
+// ---------------------------------------------------------------------------
+
+const BROKER_SKILLS: AgentSkill[] = [
+  {
+    id: "send-message",
+    name: "Send Message",
+    description: "Send a direct message to a registered agent.",
+    tags: ["messaging"],
+    examples: ["POST /send-message { from_id, to_id, text }"],
+  },
+  {
+    id: "broadcast",
+    name: "Broadcast",
+    description: "Publish a message to a topic. All subscribers receive it.",
+    tags: ["pub-sub", "messaging"],
+    examples: ["POST /broadcast { from_id, topic, text }"],
+  },
+  {
+    id: "subscribe",
+    name: "Subscribe",
+    description: "Subscribe to a topic pattern. Supports MQTT wildcards (+ and #).",
+    tags: ["pub-sub"],
+  },
+  {
+    id: "list-agents",
+    name: "List Agents",
+    description: "Discover agents on the mesh by fleet, device, type, or capability.",
+    tags: ["discovery"],
+  },
+  {
+    id: "register",
+    name: "Register",
+    description: "Register a new agent on the mesh and receive an agent_id and token.",
+    tags: ["identity"],
+  },
+];
+
+function buildBrokerCard(baseUrl: string): AgentCard {
+  return {
+    name: "agentmesh broker",
+    description: "Fleet-grade agent messaging broker for heterogeneous agents (Claude Code, OpenClaw, Hermes, custom) on private networks. Supports direct messages, topic pub/sub with MQTT wildcards, QoS 0/1, dead-letter queue, LWT, and retained messages.",
+    url: baseUrl,
+    version: VERSION.replace("agentmesh/", ""),
+    provider: {
+      organization: "Slancha",
+      url: "https://github.com/SlanchaAi/agentmesh",
+    },
+    capabilities: {
+      streaming: true,       // WebSocket push
+      pushNotifications: true, // webhook delivery for non-WS agents
+      stateTransitionHistory: false,
+    },
+    authentication: {
+      schemes: ["Bearer"],
+    },
+    defaultInputModes: ["application/json"],
+    defaultOutputModes: ["application/json"],
+    skills: BROKER_SKILLS,
+  };
+}
+
+function buildAgentCard(agent: Agent, baseUrl: string): AgentCard {
+  const skills: AgentSkill[] = agent.capabilities.map((cap) => ({
+    id: cap,
+    name: cap
+      .split(/[-_]/)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" "),
+    tags: [cap],
+  }));
+
+  if (!skills.length) {
+    skills.push({
+      id: "messaging",
+      name: "Messaging",
+      description: "Receive and send messages via the agentmesh broker.",
+      tags: ["messaging"],
+    });
+  }
+
+  const addrParts = [agent.fleet_id, agent.device_id, agent.agent_name].filter(Boolean);
+  const displayName = addrParts.length ? addrParts.join("/") : agent.agent_name || agent.id;
+
+  return {
+    name: displayName,
+    description: agent.summary || `${agent.agent_type} agent on ${agent.hostname}`,
+    url: `${baseUrl}/agent-card/${agent.id}`,
+    version: "0.1.0",
+    capabilities: {
+      streaming: agent.online,          // WS-connected agents can stream
+      pushNotifications: agent.transport.type === "webhook",
+      stateTransitionHistory: false,
+    },
+    authentication: {
+      schemes: ["Bearer"],
+    },
+    defaultInputModes: ["text/plain", "application/json"],
+    defaultOutputModes: ["text/plain", "application/json"],
+    skills,
+    agentmesh: {
+      agent_id: agent.id,
+      agent_type: agent.agent_type,
+      fleet_id: agent.fleet_id,
+      device_id: agent.device_id,
+      online: agent.online,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket message handler
 // ---------------------------------------------------------------------------
 
@@ -835,7 +948,7 @@ function handleWsFrame(ws: any, frame: WsClientFrame) {
 // HTTP request handler (extracted for clarity)
 // ---------------------------------------------------------------------------
 
-const PUBLIC_ENDPOINTS = new Set(["/register", "/health"]);
+const PUBLIC_ENDPOINTS = new Set(["/register", "/health", "/.well-known/agent.json", "/agent-card", "/agent-cards"]);
 
 async function handleHttpRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
@@ -846,9 +959,40 @@ async function handleHttpRequest(req: Request): Promise<Response> {
     return Response.json({
       status: "ok",
       version: VERSION,
-      peers: (selectAllPeers.all() as any[]).length,
+      agents: (selectAllPeers.all() as any[]).length,
+      peers: (selectAllPeers.all() as any[]).length, // backwards compat
       ws_connections: wsConnections.size,
       fleet_id: FLEET_ID,
+    });
+  }
+
+  // A2A Agent Card — broker's own card (standard discovery endpoint)
+  if (req.method === "GET" && (path === "/.well-known/agent.json" || path === "/agent-card")) {
+    const baseUrl = `${url.protocol}//${url.host}`;
+    return Response.json(buildBrokerCard(baseUrl), {
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  // A2A Agent Card — individual registered agent
+  if (req.method === "GET" && path.startsWith("/agent-card/")) {
+    const agentId = path.slice("/agent-card/".length);
+    const row = db.query("SELECT * FROM peers WHERE id = ?").get(agentId) as any | null;
+    if (!row) return Response.json({ error: "Agent not found" }, { status: 404 });
+    const agent = hydrateAgent(row);
+    const baseUrl = `${url.protocol}//${url.host}`;
+    return Response.json(buildAgentCard(agent, baseUrl), {
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  }
+
+  // A2A Agent Cards — list all agents' cards
+  if (req.method === "GET" && path === "/agent-cards") {
+    const rows = selectAllPeers.all() as any[];
+    const baseUrl = `${url.protocol}//${url.host}`;
+    const cards = rows.map((r) => buildAgentCard(hydrateAgent(r), baseUrl));
+    return Response.json(cards, {
+      headers: { "Access-Control-Allow-Origin": "*" },
     });
   }
 
