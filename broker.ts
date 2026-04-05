@@ -160,6 +160,9 @@ function removePeer(id: string) {
   db.run("DELETE FROM subscriptions WHERE agent_id = ?", [id]);
 }
 
+// Clean up subscriptions for agents that no longer exist (e.g. after broker restart)
+db.run("DELETE FROM subscriptions WHERE agent_id NOT IN (SELECT id FROM peers)");
+
 cleanStalePeers();
 setInterval(cleanStalePeers, 30_000);
 
@@ -388,6 +391,12 @@ async function handleBroadcast(body: BroadcastRequest): Promise<{ ok: boolean; d
 
   for (const sub of subscribers) {
     if (sub.agent_id === body.from_id) continue; // don't echo back to sender
+    // Skip stale subscriptions for agents that no longer exist
+    const exists = db.query("SELECT id FROM peers WHERE id = ?").get(sub.agent_id);
+    if (!exists) {
+      deleteSubscription.run(sub.agent_id, body.topic);
+      continue;
+    }
     insertMessage.run(body.from_id, sub.agent_id, body.text, body.topic, now);
     const msg = db.query("SELECT * FROM messages WHERE rowid = last_insert_rowid()").get() as Message;
     await tryWebhookDelivery(sub.agent_id, msg);
