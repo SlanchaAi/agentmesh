@@ -332,7 +332,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { topic, message } = args as { topic: string; message: string };
       if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
       try {
-        const result = await brokerFetch<{ ok: boolean; recipients?: number; error?: string }>("/broadcast", {
+        const result = await brokerFetch<{ ok: boolean; delivered_to?: string[]; error?: string }>("/broadcast", {
           from_id: myId,
           topic,
           text: message,
@@ -343,7 +343,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return {
           content: [{
             type: "text" as const,
-            text: `Broadcast to topic "${topic}" — ${result.recipients ?? 0} recipient(s)`,
+            text: `Broadcast to topic "${topic}" — ${result.delivered_to?.length ?? 0} recipient(s)`,
           }],
         };
       } catch (e) {
