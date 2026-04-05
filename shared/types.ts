@@ -1,5 +1,6 @@
 // Unique ID for each registered agent
 export type AgentId = string;
+export type PeerId = AgentId; // backwards compat alias
 
 export type AgentType = "claude-code" | "openclaw" | "hermes" | "custom";
 
@@ -9,29 +10,33 @@ export interface TransportConfig {
   poll_interval_ms?: number;
 }
 
+// Agent extends the original Peer — new fields are optional for backwards compat
 export interface Agent {
   id: AgentId;
-  agent_type: AgentType;
-  agent_name: string;
-  capabilities: string[];
-  summary: string;
-  hostname: string;
+  pid: number;
   cwd: string;
   git_root: string | null;
   tty: string | null;
-  pid: number;
-  transport: TransportConfig;
-  registered_at: string; // ISO timestamp
-  last_seen: string;     // ISO timestamp
+  hostname: string;
+  summary: string;
+  registered_at: string;
+  last_seen: string;
+  // agentmesh extensions (optional — not present on old claude-peers registrations)
+  agent_type?: AgentType;
+  agent_name?: string;
+  capabilities?: string[];
+  transport?: TransportConfig;
 }
+
+export type Peer = Agent; // backwards compat alias
 
 export interface Message {
   id: number;
   from_id: AgentId;
   to_id: AgentId;
-  topic: string | null;
+  topic?: string | null;
   text: string;
-  sent_at: string; // ISO timestamp
+  sent_at: string;
   delivered: boolean;
 }
 
@@ -42,17 +47,18 @@ export interface RegisterRequest {
   cwd: string;
   git_root: string | null;
   tty: string | null;
-  hostname: string;
+  hostname?: string;
   summary: string;
-  agent_type: AgentType;
-  agent_name: string;
-  capabilities: string[];
-  transport: TransportConfig;
+  // agentmesh extensions — optional for backwards compat with claude-peers clients
+  agent_type?: AgentType;
+  agent_name?: string;
+  capabilities?: string[];
+  transport?: TransportConfig;
 }
 
 export interface RegisterResponse {
   id: AgentId;
-  token: string;
+  token?: string; // present in agentmesh broker, absent in old claude-peers broker
 }
 
 export interface HeartbeatRequest {
@@ -64,15 +70,18 @@ export interface SetSummaryRequest {
   summary: string;
 }
 
-export interface ListAgentsRequest {
+// Kept as ListPeersRequest to match the broker endpoint name (/list-peers)
+export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo";
   cwd: string;
   git_root: string | null;
   exclude_id?: AgentId;
-  // Optional filters
+  // agentmesh filter extensions
   agent_type?: AgentType;
   capabilities?: string[];
 }
+
+export type ListAgentsRequest = ListPeersRequest; // convenience alias
 
 export interface SendMessageRequest {
   from_id: AgentId;
