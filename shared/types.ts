@@ -108,6 +108,8 @@ export interface Message {
   retry_count: number;
   max_retries: number;
   delivered: boolean;
+  /** HMAC-SHA256 of `{id}:{from_id}:{to_id}:{text}:{sent_at}` — null if fleet secret not configured */
+  signature: string | null;
 }
 
 export interface DeadLetter {

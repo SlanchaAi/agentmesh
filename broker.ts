@@ -57,13 +57,17 @@ const DISCOVERY_PORT = PORT + 1; // UDP broadcast port
 const DB_PATH = process.env.AGENTMESH_DB ?? process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.agentmesh.db`;
 const BIND = process.env.AGENTMESH_BIND ?? process.env.CLAUDE_PEERS_BIND ?? "0.0.0.0";
 const FLEET_ID = process.env.AGENTMESH_FLEET_ID ?? null;
-const VERSION = "agentmesh/0.3.0";
+const VERSION = "agentmesh/0.4.0";
 
 // QoS 1 retry: wait this long for ACK before retrying
 const ACK_DEADLINE_MS = parseInt(process.env.AGENTMESH_ACK_DEADLINE_MS ?? "60000", 10);
 const MAX_RETRIES = parseInt(process.env.AGENTMESH_MAX_RETRIES ?? "3", 10);
 // How long to keep a remote peer with no heartbeat before expiring
 const REMOTE_PEER_TTL_MS = parseInt(process.env.AGENTMESH_PEER_TTL_MS ?? "60000", 10);
+// Fleet signing secret — if set, all delivered messages include an HMAC-SHA256 signature
+const FLEET_SECRET = process.env.AGENTMESH_FLEET_SECRET ?? null;
+// Rate limiting — max messages sent per agent per minute (0 = disabled)
+const RATE_LIMIT_RPM = parseInt(process.env.AGENTMESH_RATE_LIMIT_RPM ?? "100", 10);
 
 // ---------------------------------------------------------------------------
 // Database
@@ -216,6 +220,49 @@ function validateToken(token: string | undefined): AgentId | null {
 }
 
 // ---------------------------------------------------------------------------
+// Message signing (HMAC-SHA256)
+// ---------------------------------------------------------------------------
+
+function signMessage(msg: Pick<Message, "id" | "from_id" | "to_id" | "text" | "sent_at">): string | null {
+  if (!FLEET_SECRET) return null;
+  const payload = `${msg.id}:${msg.from_id}:${msg.to_id}:${msg.text}:${msg.sent_at}`;
+  const h = new Bun.CryptoHasher("sha256", FLEET_SECRET);
+  h.update(payload);
+  return h.digest("hex");
+}
+
+/** Attach signature to a message row before delivery. Mutates in place. */
+function attachSignature<T extends Message>(msg: T): T {
+  msg.signature = signMessage(msg);
+  return msg;
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting (in-memory sliding window per agent)
+// ---------------------------------------------------------------------------
+
+// Map<agent_id, sorted array of send timestamps (ms)>
+const rateLimitWindows = new Map<string, number[]>();
+const RATE_WINDOW_MS = 60_000; // 1 minute
+
+/** Returns true if the agent is within rate limits, false if throttled. */
+function checkRateLimit(agentId: string): boolean {
+  if (RATE_LIMIT_RPM <= 0) return true; // disabled
+  const now = Date.now();
+  const cutoff = now - RATE_WINDOW_MS;
+
+  let timestamps = rateLimitWindows.get(agentId) ?? [];
+  // Evict entries outside the window
+  timestamps = timestamps.filter((t) => t > cutoff);
+
+  if (timestamps.length >= RATE_LIMIT_RPM) return false;
+
+  timestamps.push(now);
+  rateLimitWindows.set(agentId, timestamps);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Topic wildcard matching (MQTT-style)
 // + matches exactly one path segment
 // # matches zero or more trailing segments (must be last)
@@ -331,9 +378,11 @@ function pushWs(agentId: AgentId, frame: WsBrokerFrame): boolean {
 type DeliveryResult = "ws" | "webhook" | "queued";
 
 async function deliverToAgent(toId: AgentId, message: Message): Promise<DeliveryResult> {
+  const signed = attachSignature({ ...message });
+
   // 1. WebSocket — instant push (preferred for online agents)
   if (wsConnections.has(toId)) {
-    const sent = pushWs(toId, { type: "MESSAGE", message });
+    const sent = pushWs(toId, { type: "MESSAGE", message: signed });
     if (sent) {
       if (message.qos === 0) markDelivered.run(message.id); // QoS 0: fire-and-forget
       return "ws";
@@ -346,7 +395,7 @@ async function deliverToAgent(toId: AgentId, message: Message): Promise<Delivery
   ).get(toId) as { transport_type: string; transport_webhook_url: string | null } | null;
 
   if (peer?.transport_type === "webhook" && peer.transport_webhook_url) {
-    const ok = await deliverWebhook(peer.transport_webhook_url, message);
+    const ok = await deliverWebhook(peer.transport_webhook_url, signed);
     if (ok) {
       if (message.qos === 0) markDelivered.run(message.id);
       return "webhook";
@@ -619,6 +668,10 @@ function handleListPeers(body: ListPeersRequest): Agent[] {
 async function handleSendMessage(
   body: SendMessageRequest
 ): Promise<{ ok: boolean; error?: string }> {
+  if (!checkRateLimit(body.from_id)) {
+    return { ok: false, error: `Rate limit exceeded (${RATE_LIMIT_RPM} msg/min)` };
+  }
+
   const target = db.query("SELECT id, default_qos, default_ttl_ms FROM peers WHERE id = ?")
     .get(body.to_id) as { id: string; default_qos: number; default_ttl_ms: number | null } | null;
 
@@ -636,7 +689,11 @@ async function handleSendMessage(
 
 async function handleBroadcast(
   body: BroadcastRequest & { qos?: QoS }
-): Promise<{ ok: boolean; delivered_to: string[] }> {
+): Promise<{ ok: boolean; delivered_to: string[]; error?: string }> {
+  if (!checkRateLimit(body.from_id)) {
+    return { ok: false, delivered_to: [], error: `Rate limit exceeded (${RATE_LIMIT_RPM} msg/min)` };
+  }
+
   const qos = (body.qos ?? 1) as QoS;
   const deliveredTo: string[] = [];
 
@@ -713,13 +770,13 @@ function handleUnsubscribe(body: SubscribeRequest): { ok: boolean } {
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+  const messages = (selectUndelivered.all(body.id) as Message[]).map(attachSignature);
   for (const m of messages) markDelivered.run(m.id);
   return { messages };
 }
 
 function handlePeekMessages(body: PeekMessagesRequest): PeekMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+  const messages = (selectUndelivered.all(body.id) as Message[]).map(attachSignature);
   return { messages };
 }
 
@@ -956,13 +1013,16 @@ async function handleHttpRequest(req: Request): Promise<Response> {
 
   // Health check (GET or POST)
   if (path === "/health") {
+    const count = (selectAllPeers.all() as any[]).length;
     return Response.json({
       status: "ok",
       version: VERSION,
-      agents: (selectAllPeers.all() as any[]).length,
-      peers: (selectAllPeers.all() as any[]).length, // backwards compat
+      agents: count,
+      peers: count, // backwards compat
       ws_connections: wsConnections.size,
       fleet_id: FLEET_ID,
+      signing: !!FLEET_SECRET,
+      rate_limit_rpm: RATE_LIMIT_RPM > 0 ? RATE_LIMIT_RPM : null,
     });
   }
 
@@ -1043,6 +1103,12 @@ async function handleHttpRequest(req: Request): Promise<Response> {
       case "/unregister":
         handleUnregister(body as { id: string });
         return Response.json({ ok: true });
+      case "/verify-signature": {
+        const { message, signature } = body as { message: Message; signature: string };
+        if (!FLEET_SECRET) return Response.json({ ok: false, error: "Signing not configured on this broker" });
+        const expected = signMessage(message);
+        return Response.json({ ok: expected === signature, valid: expected === signature });
+      }
       default:
         return Response.json({ error: "not found" }, { status: 404 });
     }
