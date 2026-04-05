@@ -84,7 +84,75 @@ A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude
                       Claude A         Claude B
 ```
 
-The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+The broker auto-launches when the first session starts. It cleans up dead peers automatically. By default everything is localhost-only, but cross-machine messaging is supported (see below).
+
+## Cross-machine setup
+
+By default, the broker only serves localhost. To let Claude Code instances on different machines discover each other and exchange messages, point the remote machines at a shared broker.
+
+### Architecture
+
+```
+  Server (broker host)                   Mac (remote client)
+  ┌──────────────────────┐               ┌──────────────────────┐
+  │ broker.ts            │               │ server.ts            │
+  │ 0.0.0.0:7899         │◄──────────────│ BROKER_URL=          │
+  │ ~/.claude-peers.db   │               │  http://SERVER:7899  │
+  └──────┬───────────────┘               └──────┬───────────────┘
+         │                                      │
+    MCP server A                           MCP server B
+    (local)                                (remote)
+         │                                      │
+    Claude A                               Claude B
+```
+
+### 1. Ensure the broker is reachable
+
+The broker binds `0.0.0.0:7899` by default, so it accepts connections from any interface. Make sure port 7899 is open between the machines (firewall, security group, etc.).
+
+### 2. On the remote machine
+
+Clone and install as usual, then register the MCP server with `CLAUDE_PEERS_BROKER_URL` pointing at the broker host:
+
+```bash
+git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp
+cd ~/claude-peers-mcp && bun install
+```
+
+Add to your Claude Code MCP config (`~/.claude.json` or project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "claude-peers": {
+      "type": "stdio",
+      "command": "bun",
+      "args": ["/path/to/claude-peers-mcp/server.ts"],
+      "env": {
+        "CLAUDE_PEERS_BROKER_URL": "http://BROKER_HOST_IP:7899"
+      }
+    }
+  }
+}
+```
+
+Replace `BROKER_HOST_IP` with the server's LAN or public IP.
+
+### 3. Verify
+
+From either machine:
+
+```
+> list peers
+
+# Should show peers from both machines with their hostname, CWD, and summary
+```
+
+### Gotchas
+
+- **`to_id` not `to`:** The `send_message` tool parameter is `to_id`. Using `to` silently sends `undefined` and the broker returns "Peer undefined not found."
+- **Stale remote peers:** The broker can't verify remote PIDs with `kill(pid, 0)`, so remote peers expire by heartbeat timeout (60s) instead. If a remote peer appears stale, it will be cleaned up automatically.
+- **`set_summary` on startup:** Always call `set_summary` at the start of a session so other peers have context when they discover you.
 
 ## Auto-summary
 
@@ -109,9 +177,11 @@ bun cli.ts kill-broker       # stop the broker
 
 | Environment variable | Default              | Description                           |
 | -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| `CLAUDE_PEERS_PORT`       | `7899`               | Broker port                                          |
+| `CLAUDE_PEERS_DB`         | `~/.claude-peers.db` | SQLite database path                                 |
+| `CLAUDE_PEERS_BROKER_URL` | `http://127.0.0.1:7899` | Broker URL — set on remote machines for cross-machine use |
+| `CLAUDE_PEERS_BIND`       | `0.0.0.0`           | Broker bind address                                  |
+| `OPENAI_API_KEY`          | —                    | Enables auto-summary via gpt-5.4-nano                |
 
 ## Requirements
 

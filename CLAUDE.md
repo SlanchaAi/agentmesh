@@ -8,13 +8,23 @@ alwaysApply: false
 
 Peer discovery and messaging MCP channel for Claude Code instances.
 
+## Session startup
+
+Always call `set_summary` at the start of a session so other peers have context when they discover you.
+
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
+- `broker.ts` — Singleton HTTP daemon on 0.0.0.0:7899 + SQLite. Auto-launched by the MCP server. Accepts remote peers.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker (default 127.0.0.1:7899, override with `CLAUDE_PEERS_BROKER_URL`), exposes tools, pushes channel notifications.
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
 - `cli.ts` — CLI utility for inspecting broker state.
+
+## Cross-machine
+
+The broker binds 0.0.0.0 by default. Remote clients set `CLAUDE_PEERS_BROKER_URL=http://BROKER_IP:7899` to connect. Both local and remote peers appear in the same peer list and can exchange messages.
+
+**Gotcha:** The `send_message` tool parameter is `to_id` (not `to`). Using the wrong name sends `undefined` as the peer ID.
 
 ## Running
 

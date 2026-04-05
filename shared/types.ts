@@ -1,22 +1,41 @@
-// Unique ID for each Claude Code instance (generated on registration)
-export type PeerId = string;
+// Unique ID for each agent instance (generated on registration)
+export type AgentId = string;
+// Backwards-compatible alias
+export type PeerId = AgentId;
+
+export type AgentType = "claude-code" | "openclaw" | "hermes" | "custom";
+
+export type TransportType = "poll" | "webhook" | "channel";
+
+export interface TransportConfig {
+  type: TransportType;
+  webhook_url?: string; // required if type is "webhook"
+  poll_interval_ms?: number; // hint for poll-based agents
+}
 
 export interface Peer {
-  id: PeerId;
+  id: AgentId;
   pid: number;
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  hostname: string;
   summary: string;
+  // agentmesh extensions
+  agent_type: AgentType;
+  agent_name: string;
+  capabilities: string[];
+  transport: TransportConfig;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
 
 export interface Message {
   id: number;
-  from_id: PeerId;
-  to_id: PeerId;
+  from_id: AgentId;
+  to_id: AgentId;
   text: string;
+  topic: string | null; // null = direct message, string = topic broadcast
   sent_at: string; // ISO timestamp
   delivered: boolean;
 }
@@ -28,19 +47,26 @@ export interface RegisterRequest {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  hostname?: string;
   summary: string;
+  // agentmesh extensions (all optional for backwards compat)
+  agent_type?: AgentType;
+  agent_name?: string;
+  capabilities?: string[];
+  transport?: TransportConfig;
 }
 
 export interface RegisterResponse {
-  id: PeerId;
+  id: AgentId;
+  token: string; // auth token for subsequent requests
 }
 
 export interface HeartbeatRequest {
-  id: PeerId;
+  id: AgentId;
 }
 
 export interface SetSummaryRequest {
-  id: PeerId;
+  id: AgentId;
   summary: string;
 }
 
@@ -49,17 +75,36 @@ export interface ListPeersRequest {
   // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;
-  exclude_id?: PeerId;
+  exclude_id?: AgentId;
+  // agentmesh filters
+  agent_type?: AgentType;
+  capabilities?: string[]; // filter to agents with ALL of these capabilities
 }
 
 export interface SendMessageRequest {
-  from_id: PeerId;
-  to_id: PeerId;
+  from_id: AgentId;
+  to_id: AgentId;
   text: string;
 }
 
+export interface BroadcastRequest {
+  from_id: AgentId;
+  topic: string;
+  text: string;
+}
+
+export interface SubscribeRequest {
+  id: AgentId;
+  topic: string;
+}
+
+export interface UnsubscribeRequest {
+  id: AgentId;
+  topic: string;
+}
+
 export interface PollMessagesRequest {
-  id: PeerId;
+  id: AgentId;
 }
 
 export interface PollMessagesResponse {
